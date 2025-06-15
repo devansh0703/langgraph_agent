@@ -73,7 +73,7 @@ DB_HOST="db"
 DB_NAME="customer_db"
 DB_USER="user"
 DB_PASSWORD="password"
-
+```
 ### Data Preparation (`init.sql`)
 
 The `init.sql` file contains the SQL DDL (Data Definition Language) for creating the `customer_purchases` table and DML (Data Manipulation Language) for inserting sample data. This data is derived from `customer_data.csv`.
