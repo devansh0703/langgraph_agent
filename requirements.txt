@@ -1,0 +1,9 @@
+pandas
+langchain-core
+langchain-google-genai
+langgraph
+fastapi
+uvicorn[standard]
+python-dotenv
+psycopg2-binary
+google-generativeai

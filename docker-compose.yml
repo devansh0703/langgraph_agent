@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "5432:5432" # Expose DB port to host for direct access if needed
+    volumes:
+      - pg_data:/var/lib/postgresql/data # Persist database data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql # Initialize DB with schema and data
+    healthcheck: # Basic health check to ensure DB is ready
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000" # Expose FastAPI app port to host
+    environment:
+      # Pass environment variables to the app container from .env file
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      LLM_MODEL: ${LLM_MODEL}
+      DB_HOST: db # This matches the service name of the database container
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+    depends_on:
+      db:
+        condition: service_healthy # Ensure the app starts only after DB is healthy
+    # The CMD in Dockerfile already includes a sleep and then starts uvicorn.
+    # This explicit command line overrides Dockerfile CMD. For this case, Dockerfile CMD is fine.
+
+volumes:
+  pg_data: # Define named volume for database persistence
