@@ -2,14 +2,17 @@ import pandas as pd
 from typing import TypedDict, List, Dict, Any, Union
 from langgraph.graph import StateGraph, END
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from langchain_google_genai import ChatGoogleGenerativeAI # For Gemini
 import google.generativeai as genai
+# Changed import from langchain_core.pydantic_v1 to pydantic directly
+from pydantic import BaseModel, Field # For structured LLM output parsing
 
 import os
+import json # For JSON parsing from LLM
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+
 from db_manager import db_manager # Import the database manager
 
 load_dotenv() # Load environment variables
@@ -64,7 +67,7 @@ class AgentState(TypedDict):
 
 def customer_context_agent(state: AgentState) -> AgentState:
     """
-    Extracts the customer's profile and purchase history from the database.
+    Extracts the customer's profile and purchase history from the database. (Rule-based)
     """
     print("--- Customer Context Agent ---")
     customer_id = state['customer_id']
@@ -79,7 +82,6 @@ def customer_context_agent(state: AgentState) -> AgentState:
         print(f"Customer ID {customer_id} not found in DB.")
         return {**state, "error": f"Customer ID {customer_id} not found."}
 
-    # Extract unique customer profile details (assuming they are consistent across rows for a customer)
     first_row = customer_data_df.iloc[0]
     customer_profile = {
         "customer_name": first_row['Customer Name'],
@@ -91,7 +93,6 @@ def customer_context_agent(state: AgentState) -> AgentState:
         "account_type": str(first_row['Account Type'])
     }
 
-    # Get full purchase history for the customer (relevant columns only)
     customer_purchase_history = customer_data_df[[
         'Product', 'Quantity', 'Unit Price (USD)', 'Total Price (USD)', 'Purchase Date'
     ]].to_dict(orient='records')
@@ -107,7 +108,7 @@ def customer_context_agent(state: AgentState) -> AgentState:
 def purchase_pattern_analysis_agent(state: AgentState) -> AgentState:
     """
     Identifies frequent purchases for the customer and products commonly bought
-    by similar industry peers but missing for the current customer.
+    by similar industry peers but missing for the current customer. (Rule-based, for factual data)
     """
     print("--- Purchase Pattern Analysis Agent ---")
     if state.get("error"):
@@ -117,15 +118,12 @@ def purchase_pattern_analysis_agent(state: AgentState) -> AgentState:
     customer_purchase_history = state['customer_purchase_history']
     customer_profile = state['customer_profile']
 
-    # 1. Identify frequent products for this customer
     purchased_products = [p['Product'] for p in customer_purchase_history]
-    frequent_products = list(set(purchased_products)) # Unique products purchased
+    frequent_products = list(set(purchased_products)) 
 
-    # 2. Identify missing opportunities from industry peers
     target_industry = customer_profile['industry']
     
     try:
-        # Fetch all products from customers in the same industry (excluding current customer)
         query = f'SELECT DISTINCT "Product" FROM customer_purchases WHERE "Industry" = %s AND "Customer ID" != %s'
         industry_peer_products_df = db_manager.fetch_data_as_df(query, (target_industry, customer_id))
         all_peer_products = set(industry_peer_products_df['Product'].tolist())
@@ -144,71 +142,98 @@ def purchase_pattern_analysis_agent(state: AgentState) -> AgentState:
         "missing_opportunities_products": missing_opportunities_products
     }
 
+# Pydantic model for LLM Product Affinity output
+class ProductSuggestion(BaseModel):
+    product: str = Field(description="Name of the suggested product.")
+    rationale: str = Field(description="Reason for suggesting this product, explaining its complementary nature.")
+
+class ProductAffinitySuggestions(BaseModel):
+    suggestions: List[ProductSuggestion] = Field(description="List of suggested complementary products.")
+
+
 def product_affinity_agent(state: AgentState) -> AgentState:
     """
-    Suggests related products based on co-occurrence patterns across all customer purchases in the database.
+    Suggests related products using LLM-based reasoning about complementarity. (LLM-driven)
     """
-    print("--- Product Affinity Agent ---")
+    print("--- Product Affinity Agent (LLM-Driven) ---")
     if state.get("error"):
         return state
 
-    customer_purchased_products = set(state['frequent_products'])
+    customer_purchased_products = state['frequent_products']
+    customer_industry = state['customer_profile']['industry']
+
+    if not customer_purchased_products:
+        print("No frequent products found for customer, skipping LLM affinity suggestions.")
+        return {**state, "related_product_suggestions": []}
+
+    # Ensure to pass format_instructions to the prompt template
+    parser = JsonOutputParser(pydantic_object=ProductAffinitySuggestions)
+    format_instructions = parser.get_format_instructions()
+
+    prompt_template = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You are an expert product analyst. Given a customer's frequently purchased products and their industry, "
+                "suggest 3-5 highly complementary or related products that the customer might benefit from, "
+                "even if they haven't been directly co-purchased by others. Focus on logical relationships, common industry needs, "
+                "or product ecosystem expansion.\n"
+                "Provide a clear rationale for each suggestion.\n"
+                "The suggestions must be new products not already purchased by the customer.\n"
+                "Output your response in JSON format according to the following schema:\n{format_instructions}"
+            ),
+            (
+                "human",
+                "Customer's industry: {customer_industry}\n"
+                "Customer's frequently purchased products: {frequent_products}\n"
+                "Products already owned by the customer (DO NOT suggest these): {frequent_products}\n\n"
+                "Provide product suggestions and their rationales."
+            ),
+        ]
+    )
+
+    # Pass format_instructions to the prompt's .invoke or .format method
+    chain = prompt_template.partial(format_instructions=format_instructions) | llm | parser
 
     try:
-        # Fetch all purchase data to build co-occurrence
-        all_purchases_df = db_manager.fetch_data_as_df('SELECT "Customer ID", "Product" FROM customer_purchases')
+        llm_response = chain.invoke({
+            "customer_industry": customer_industry,
+            "frequent_products": ", ".join(customer_purchased_products)
+        })
+        related_product_suggestions_raw = llm_response.get('suggestions', [])
+        
+        # Filter out any suggestions that the customer already owns (LLM might hallucinate)
+        existing_products_set = set(customer_purchased_products)
+        related_product_suggestions = [
+            s for s in related_product_suggestions_raw if s['product'] not in existing_products_set
+        ]
+
+        print(f"LLM-generated related product suggestions: {related_product_suggestions}")
     except Exception as e:
-        return {**state, "error": f"Database error fetching all purchases for affinity: {e}"}
-
-    product_co_occurrences: Dict[str, Dict[str, int]] = {}
-    
-    for _, group in all_purchases_df.groupby('Customer ID'):
-        products_in_group = list(group['Product'].unique())
-        for i, p1 in enumerate(products_in_group):
-            if p1 not in product_co_occurrences:
-                product_co_occurrences[p1] = {}
-            for j, p2 in enumerate(products_in_group):
-                if i != j:
-                    product_co_occurrences[p1][p2] = product_co_occurrences[p1].get(p2, 0) + 1
-
-    related_product_suggestions = []
-    for purchased_product in customer_purchased_products:
-        if purchased_product in product_co_occurrences:
-            sorted_co_occurrences = sorted(
-                product_co_occurrences[purchased_product].items(),
-                key=lambda item: item[1],
-                reverse=True
-            )
-            for related_product, count in sorted_co_occurrences:
-                if related_product not in customer_purchased_products:
-                    related_product_suggestions.append({
-                        "product": related_product,
-                        "suggested_for": purchased_product,
-                        "rationale": f"Frequently co-purchased with '{purchased_product}' ({count} times by other customers).",
-                        "co_occurrence_count": count
-                    })
-    
-    unique_suggestions = {}
-    for suggestion in related_product_suggestions:
-        prod_name = suggestion['product']
-        if prod_name not in unique_suggestions or suggestion['co_occurrence_count'] > unique_suggestions[prod_name]['co_occurrence_count']:
-            unique_suggestions[prod_name] = suggestion
-    
-    related_product_suggestions = list(unique_suggestions.values())
-
-    print(f"Related product suggestions: {related_product_suggestions}")
+        print(f"Error generating product affinity suggestions with LLM: {e}")
+        related_product_suggestions = [] # Default to empty list on error
 
     return {
         **state,
         "related_product_suggestions": related_product_suggestions
     }
 
+# Pydantic model for LLM Opportunity Scoring output
+class ScoredOpportunity(BaseModel):
+    product: str = Field(description="Name of the recommended product.")
+    type: str = Field(description="Type of opportunity (Cross-Sell or Upsell).")
+    score: int = Field(description="Score (1-10) indicating the potential impact/relevance, 10 being highest.", ge=1, le=10)
+    rationale: str = Field(description="Detailed reason for this recommendation, combining all relevant insights.")
+
+class ScoredOpportunitiesList(BaseModel):
+    opportunities: List[ScoredOpportunity] = Field(description="List of scored cross-sell and upsell opportunities.")
+
+
 def opportunity_scoring_agent(state: AgentState) -> AgentState:
     """
-    Scores potential cross-sell and upsell opportunities by combining insights
-    from missing products (peers buy) and product affinity analysis.
+    Scores potential cross-sell and upsell opportunities using LLM-based reasoning and prioritization. (LLM-driven)
     """
-    print("--- Opportunity Scoring Agent ---")
+    print("--- Opportunity Scoring Agent (LLM-Driven) ---")
     if state.get("error"):
         return state
 
@@ -217,76 +242,67 @@ def opportunity_scoring_agent(state: AgentState) -> AgentState:
     missing_opportunities_products = state['missing_opportunities_products']
     related_product_suggestions = state['related_product_suggestions']
 
-    customer_purchased_categories = {get_product_category(p) for p in frequent_products}
+    # Prepare input for LLM
+    customer_info = json.dumps(customer_profile, indent=2)
+    current_products_str = ", ".join(frequent_products) if frequent_products else "None"
+    missing_from_peers_str = ", ".join(missing_opportunities_products) if missing_opportunities_products else "None"
+    affinity_suggestions_str = json.dumps(related_product_suggestions, indent=2) if related_product_suggestions else "None"
 
-    potential_products = {} # Product name -> {score, rationale, type}
+    # Ensure to pass format_instructions to the prompt template
+    parser = JsonOutputParser(pydantic_object=ScoredOpportunitiesList)
+    format_instructions = parser.get_format_instructions()
 
-    # 1. Opportunities from missing products (peers buy, customer doesn't)
-    for product in missing_opportunities_products:
-        current_score_data = potential_products.get(product, {"score": 0, "rationale": ""})
-        current_score = current_score_data["score"]
-        current_rationale_parts = [r for r in current_score_data["rationale"].split(". ") if r]
+    prompt_template = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You are an expert sales strategist. Analyze the provided customer data and identified opportunities "
+                "to pinpoint the top 5 most impactful cross-sell and upsell recommendations. "
+                "For each recommendation, clearly state the product, whether it's a 'Cross-Sell' or 'Upsell' opportunity, "
+                "assign a 'score' from 1 to 10 (10 being the highest potential/relevance), "
+                "and provide a concise yet comprehensive 'rationale' that summarizes ALL relevant insights "
+                "(e.g., existing purchases, peer behavior, product affinity, logical fit, etc.).\n"
+                "Prioritize recommendations that offer the most value to the customer and significant growth for the business.\n"
+                "Exclude any products the customer already frequently purchases.\n"
+                "Output your response strictly in JSON format according to the following schema:\n{format_instructions}"
+            ),
+            (
+                "human",
+                "Customer Profile:\n{customer_info}\n\n"
+                "Customer's Frequently Purchased Products: {current_products_str}\n\n"
+                "Products Purchased by Industry Peers (Missing for this customer):\n{missing_from_peers_str}\n\n"
+                "AI-Generated Related Product Suggestions:\n{affinity_suggestions_str}\n\n"
+                "Generate the top 5 scored cross-sell and upsell opportunities."
+            ),
+        ]
+    )
 
-        score = 0.7 # Baseline for being a missing product
-        product_category = get_product_category(product)
-        
-        if product_category in customer_purchased_categories:
-            op_type = "Upsell"
-            score += 0.1 # Slight boost for direct category relevance
-            current_rationale_parts.append(f"Customer already purchases items in the '{product_category}' category, suggesting an upsell.")
-        else:
-            op_type = "Cross-Sell"
-            current_rationale_parts.append(f"Product is in a new category ('{product_category}'), indicating a cross-sell opportunity.")
-            
-        current_rationale_parts.append(f"Many peers in '{customer_profile['industry']}' industry purchase '{product}'.")
+    # Pass format_instructions to the prompt's .invoke or .format method
+    chain = prompt_template.partial(format_instructions=format_instructions) | llm | parser
 
-        for aff_sugg in related_product_suggestions:
-            if aff_sugg['product'] == product:
-                score += 0.2 # Significant boost if it's both missing and related
-                current_rationale_parts.append(aff_sugg['rationale'])
-                break
+    try:
+        llm_response = chain.invoke({
+            "customer_info": customer_info,
+            "current_products_str": current_products_str,
+            "missing_from_peers_str": missing_from_peers_str,
+            "affinity_suggestions_str": affinity_suggestions_str
+        })
+        scored_opportunities_raw = llm_response.get('opportunities', [])
 
-        if product not in potential_products or score > current_score:
-            potential_products[product] = {
-                "product": product,
-                "type": op_type,
-                "score": score,
-                "rationale": ". ".join(filter(None, current_rationale_parts)).strip()
-            }
-        
-    # 2. Opportunities purely from product affinity
-    for suggestion in related_product_suggestions:
-        product = suggestion['product']
-        if product not in frequent_products:
-            current_score_data = potential_products.get(product, {"score": 0, "rationale": ""})
-            current_score = current_score_data["score"]
-            current_rationale_parts = [r for r in current_score_data["rationale"].split(". ") if r]
+        # Filter out any recommendations for products the customer already owns (LLM might hallucinate)
+        existing_products_set = set(frequent_products)
+        scored_opportunities = [
+            opp for opp in scored_opportunities_raw if opp['product'] not in existing_products_set
+        ]
 
-            score = 0.6 # Baseline for affinity
-            product_category = get_product_category(product)
+        # Sort by score (highest first)
+        scored_opportunities = sorted(scored_opportunities, key=lambda x: x.get('score', 0), reverse=True)
 
-            if product_category in customer_purchased_categories:
-                op_type = "Upsell"
-                current_rationale_parts.append(f"Customer already purchases items in the '{product_category}' category, suggesting an upsell.")
-            else:
-                op_type = "Cross-Sell"
-                current_rationale_parts.append(f"Product is in a new category ('{product_category}'), indicating a cross-sell opportunity.")
-
-
-            current_rationale_parts.append(suggestion['rationale'])
-            score += min(suggestion['co_occurrence_count'] * 0.005, 0.2) # Boost based on co-occurrence, capped.
-
-            if product not in potential_products or score > current_score:
-                 potential_products[product] = {
-                    "product": product,
-                    "type": op_type,
-                    "score": score,
-                    "rationale": ". ".join(filter(None, current_rationale_parts)).strip()
-                }
-
-    scored_opportunities = sorted(potential_products.values(), key=lambda x: x['score'], reverse=True)
-
-    print(f"Scored opportunities: {scored_opportunities}")
+        print(f"LLM-scored opportunities: {scored_opportunities}")
+    except Exception as e:
+        print(f"Error generating scored opportunities with LLM: {e}")
+        # Capture the LLM error in the state to propagate it
+        return {**state, "error": f"Error in Opportunity Scoring Agent: {e}"}
 
     return {
         **state,
@@ -296,30 +312,28 @@ def opportunity_scoring_agent(state: AgentState) -> AgentState:
 def recommendation_report_agent(state: AgentState) -> AgentState:
     """
     Generates a natural-language research report and structured recommendations
-    based on all gathered insights using the LLM.
+    based on all gathered insights, now including AI-driven affinity and scoring. (LLM-driven)
     """
-    print("--- Recommendation Report Agent ---")
+    print("--- Recommendation Report Agent (LLM-Driven) ---")
     if state.get("error"):
         return state
 
     customer_profile = state['customer_profile']
     frequent_products = state['frequent_products']
     missing_opportunities_products = state['missing_opportunities_products']
-    related_product_suggestions = state['related_product_suggestions']
-    scored_opportunities = state['scored_opportunities']
+    related_product_suggestions = state['related_product_suggestions'] # Now from LLM
+    scored_opportunities = state['scored_opportunities'] # Now from LLM, with scores/rationales
 
     top_recommendations_structured = []
-    unique_rec_products = set()
-    for opp in scored_opportunities:
-        if opp['product'] not in unique_rec_products:
+    # Take top 5 from LLM-scored opportunities (already sorted)
+    # Ensure scored_opportunities is not empty before attempting to slice
+    if scored_opportunities:
+        for opp in scored_opportunities[:5]:
             top_recommendations_structured.append({
                 "product": opp['product'],
                 "type": opp['type'],
-                "reason": opp['rationale']
+                "reason": opp['rationale'] # Use LLM-generated rationale
             })
-            unique_rec_products.add(opp['product'])
-        if len(top_recommendations_structured) >= 5:
-            break
 
     customer_overview_str = (
         f"- Industry: {customer_profile.get('industry', 'N/A')}\n"
@@ -343,17 +357,17 @@ def recommendation_report_agent(state: AgentState) -> AgentState:
     if related_product_suggestions:
         affinity_summaries = []
         for s in related_product_suggestions:
-            affinity_summaries.append(f"{s['product']} (often co-purchased with {s['suggested_for']})")
-        data_analysis_str += f"- Product affinity analysis suggests complementary items: {'; '.join(affinity_summaries)}.\n"
+            affinity_summaries.append(f"{s['product']} (AI-suggested as complementary: {s['rationale']})")
+        data_analysis_str += f"- AI-driven product affinity analysis suggests complementary items: {'; '.join(affinity_summaries)}.\n"
     else:
-        data_analysis_str += "- No specific product affinities identified across the customer base.\n"
+        data_analysis_str += "- No specific product affinities identified through AI analysis.\n"
 
     if scored_opportunities:
-        data_analysis_str += "\nDetailed insights from scored opportunities:\n"
+        data_analysis_str += "\nDetailed insights from AI-scored opportunities:\n"
         for i, opp in enumerate(scored_opportunities[:5]): # Show top 5 for detailed analysis section
-            data_analysis_str += f"  - {opp['product']} ({opp['type']}) - Score: {opp['score']:.2f}. Rationale: {opp['rationale']}\n"
+            data_analysis_str += f"  - {opp['product']} (Type: {opp['type']}, Score: {opp['score']}/10). Rationale: {opp['rationale']}\n"
     else:
-        data_analysis_str += "\n  No specific cross-sell/upsell opportunities identified based on current data."
+        data_analysis_str += "\n  No specific cross-sell/upsell opportunities identified based on current AI analysis."
 
     recommendations_str = ""
     if top_recommendations_structured:
@@ -367,14 +381,14 @@ def recommendation_report_agent(state: AgentState) -> AgentState:
             (
                 "system",
                 "You are an expert sales and marketing analyst. Generate a comprehensive "
-                "research report and actionable recommendations based on provided customer data. "
+                "research report and actionable recommendations based on provided customer data and AI analysis. "
                 "The report must be professional, insightful, and strictly follow the specified structure. "
                 "Focus on identifying clear cross-sell (selling new products/services to existing customers) "
                 "and upsell (encouraging customers to buy more expensive, premium, or additional features of products they already own) opportunities.\n"
                 "Ensure the 'Data Analysis' section clearly articulates findings from purchase patterns, "
-                "peer benchmarking, and product affinity analysis.\n"
+                "peer benchmarking, and the **AI-driven product affinity and opportunity scoring results**.\n"
                 "The 'Recommendations' section should be a concise, numbered list of actionable suggestions, "
-                "directly referencing the type (Cross-Sell or Upsell) and a brief reason.\n"
+                "directly referencing the type (Cross-Sell or Upsell) and the **AI-generated rationale**.\n"
                 "The 'Conclusion' should summarize the potential impact and be forward-looking.\n\n"
                 "Report Structure to follow:\n"
                 "Research Report: Cross-Sell and Upsell Opportunities for {customer_name}\n\n"
@@ -412,13 +426,11 @@ def recommendation_report_agent(state: AgentState) -> AgentState:
     try:
         chain = prompt | llm | StrOutputParser()
         full_report = chain.invoke({})
-        # DEBUG PRINTS to confirm content before returning
-        print(f"DEBUG: Report content length before return: {len(full_report)}")
-        print(f"DEBUG: Recommendations count before return: {len(top_recommendations_structured)}")
     except Exception as e:
         full_report = f"Error generating report with LLM: {e}"
         print(full_report)
-        return {**state, "error": full_report}
+        # Propagate the error for the API to catch
+        return {**state, "error": f"Error in Recommendation Report Agent: {e}"}
 
     print("Report generated successfully.")
     return {
@@ -451,7 +463,14 @@ workflow.add_conditional_edges(
 workflow.add_edge("purchase_pattern_analysis", "product_affinity_agent")
 workflow.add_edge("product_affinity_agent", "opportunity_scoring_agent")
 workflow.add_edge("opportunity_scoring_agent", "recommendation_report_agent")
+# Add a conditional edge from opportunity_scoring_agent to check for errors
+workflow.add_conditional_edges(
+    "opportunity_scoring_agent",
+    lambda state: "end" if state.get("error") and "Error in Opportunity Scoring Agent" in state.get("error", "") else "continue",
+    {"continue": "recommendation_report_agent", "end": END}
+)
 workflow.add_edge("recommendation_report_agent", END)
+
 
 # Compile the graph
 app_workflow = workflow.compile() # Renamed to avoid conflict with FastAPI 'app'
@@ -485,18 +504,21 @@ async def get_recommendation(customer_id: str):
     try:
         inputs = {"customer_id": customer_id}
         
-        # --- CRITICAL CHANGE HERE: Use invoke instead of astream ---
+        # Use invoke instead of astream to get the final accumulated state
         final_state_value = app_workflow.invoke(inputs)
-        # -----------------------------------------------------------
         
-        # The 'invoke' method returns the final state directly, so no need for collected_states or END extraction
-        # We don't need `if END in final_state_value: final_state_value = final_state_value[END]` anymore
-        
-        # DEBUG: Print the final state captured by FastAPI
-        print(f"DEBUG: Final state received by FastAPI: {final_state_value}")
-
         if final_state_value.get("error"):
-            if "not found" in final_state_value["error"]:
+            # Check if the error is from the pipeline
+            if "Error in Opportunity Scoring Agent" in final_state_value["error"] or \
+               "Error in Recommendation Report Agent" in final_state_value["error"]:
+                # If LLM related error, return 500 but include the error message
+                return RecommendationResponse(
+                    customer_id=customer_id,
+                    research_report="Report generation failed due to an internal AI error.",
+                    recommendations=[],
+                    error=final_state_value["error"]
+                )
+            elif "not found" in final_state_value["error"]:
                 raise HTTPException(status_code=404, detail=final_state_value["error"])
             else:
                 raise HTTPException(status_code=500, detail=final_state_value["error"])
